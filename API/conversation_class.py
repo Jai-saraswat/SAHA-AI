@@ -1,300 +1,1302 @@
-import uuid
-from datetime import datetime, timezone
-from pathlib import Path
+from typing import Any
 
-from dotenv import load_dotenv
-
-from postgres import (
+from API.postgres import (
     execute_read_only,
     execute_read_write,
+    get_conversation,
+    get_message,
+    update_conversation,
+    delete_conversation,
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ENV_FILE = PROJECT_ROOT / "Database" / ".env"
+# =====================================================================
+# CONSTANTS
+# =====================================================================
 
-load_dotenv(ENV_FILE)
+VALID_SENDER_TYPES = {
+    "client",
+    "therapist",
+}
 
+VALID_CONVERSATION_STATUSES = {
+    "active",
+    "paused",
+    "ended",
+}
+
+
+# =====================================================================
+# CONVERSATION SESSION
+# =====================================================================
 
 class ConversationSession:
     """
-    Represents one conversation session for one user.
+    Domain/session layer for a shared client-therapist conversation.
+
+    SAHA is NOT a conversation sender.
+
+    Valid senders are only:
+
+        client
+        therapist
+
+    The relationship determines which user is allowed to use
+    each sender type.
     """
+
+    # -----------------------------------------------------------------
+    # INITIALIZATION
+    # -----------------------------------------------------------------
 
     def __init__(
         self,
-        user_id: str | None = None,
-        session_id: str | None = None,
+        relationship_id: str | None = None,
+        conversation_id: str | None = None,
         topic: str | None = None,
     ):
-        self.session_id = (
-            session_id
-            if session_id
-            else str(uuid.uuid4())
-        )
+        if not relationship_id and not conversation_id:
+            raise ValueError(
+                "Either relationship_id or conversation_id "
+                "must be provided."
+            )
 
-        self.sequence_number = 0
+        if relationship_id and conversation_id:
+            raise ValueError(
+                "Provide either relationship_id or conversation_id, "
+                "not both."
+            )
 
-        self.started_at = datetime.now(
-            timezone.utc
-        ).isoformat()
-
+        self.relationship_id = relationship_id
+        self.conversation_id = conversation_id
         self.topic = topic
 
-        if session_id:
+        self.client_user_id: str | None = None
+        self.therapist_user_id: str | None = None
 
-            conversation_query = """
-            SELECT
-                user_id,
-                topic,
-                started_at
-            FROM conversations
-            WHERE conversation_id = %s;
-            """
+        self.status: str | None = None
+        self.started_at = None
+        self.ended_at = None
 
-            conversation_result = execute_read_only(
-                self._parameterize(
-                    conversation_query,
-                    (self.session_id,),
-                )
+        self._next_sequence_number = 1
+
+        # -------------------------------------------------------------
+        # Existing conversation
+        # -------------------------------------------------------------
+
+        if conversation_id:
+
+            self._load_existing_conversation(
+                conversation_id
             )
 
-            if not conversation_result:
-                raise ValueError(
-                    f"Conversation '{self.session_id}' does not exist."
-                )
-
-            self.user_id = conversation_result[0]["user_id"]
-            self.topic = conversation_result[0]["topic"]
-            self.started_at = conversation_result[0]["started_at"]
-
-            sequence_query = """
-            SELECT
-                COALESCE(MAX(sequence_number), 0) AS sequence_number
-            FROM conversation_messages
-            WHERE conversation_id = %s;
-            """
-
-            sequence_result = execute_read_only(
-                self._parameterize(
-                    sequence_query,
-                    (self.session_id,),
-                )
-            )
-
-            self.sequence_number = (
-                sequence_result[0]["sequence_number"]
-            )
+        # -------------------------------------------------------------
+        # New conversation
+        # -------------------------------------------------------------
 
         else:
 
-            if not user_id:
-                raise ValueError(
-                    "user_id is required when creating a new conversation."
-                )
+            self._load_relationship(
+                relationship_id
+            )
 
-            self.user_id = user_id
+    # =================================================================
+    # LOADING
+    # =================================================================
 
-    def create(self):
+    def _load_existing_conversation(
+        self,
+        conversation_id: str,
+    ):
         """
-        Create the conversation session in PostgreSQL.
+        Load an existing conversation and its relationship context.
+        """
+
+        conversation = get_conversation(
+            conversation_id
+        )
+
+        if conversation is None:
+            raise ValueError(
+                "Conversation not found."
+            )
+
+        self.conversation_id = (
+            conversation["conversation_id"]
+        )
+
+        self.relationship_id = (
+            conversation["relationship_id"]
+        )
+
+        self.client_user_id = (
+            conversation["client_user_id"]
+        )
+
+        self.therapist_user_id = (
+            conversation["therapist_user_id"]
+        )
+
+        self.topic = conversation["topic"]
+
+        self.status = conversation["status"]
+
+        self.started_at = conversation[
+            "started_at"
+        ]
+
+        self.ended_at = conversation[
+            "ended_at"
+        ]
+
+        # -------------------------------------------------------------
+        # Determine next sequence number.
+        #
+        # Deleted messages retain their sequence number, therefore
+        # the maximum sequence number must include deleted rows.
+        # -------------------------------------------------------------
+
+        query = """
+        SELECT
+            COALESCE(
+                MAX(sequence_number),
+                0
+            ) AS max_sequence_number
+
+        FROM conversation_messages
+
+        WHERE
+            conversation_id = %s;
+        """
+
+        result = execute_read_only(
+            query,
+            (
+                self.conversation_id,
+            ),
+        )
+
+        max_sequence_number = int(
+            result[0]["max_sequence_number"]
+        )
+
+        self._next_sequence_number = (
+            max_sequence_number + 1
+        )
+
+    def _load_relationship(
+        self,
+        relationship_id: str,
+    ):
+        """
+        Load relationship participants for a new conversation.
         """
 
         query = """
+        SELECT
+            relationship_id,
+            client_user_id,
+            therapist_user_id,
+            status,
+            started_at,
+            ended_at
+
+        FROM user_relationships
+
+        WHERE
+            relationship_id = %s
+            AND deleted_at IS NULL;
+        """
+
+        result = execute_read_only(
+            query,
+            (
+                relationship_id,
+            ),
+        )
+
+        if not result:
+            raise ValueError(
+                "Relationship not found."
+            )
+
+        relationship = result[0]
+
+        relationship_status = (
+            relationship["status"]
+        )
+
+        if relationship_status == "ended":
+            raise ValueError(
+                "Cannot create a conversation "
+                "for an ended relationship."
+            )
+
+        self.relationship_id = str(
+            relationship[
+                "relationship_id"
+            ]
+        )
+
+        self.client_user_id = str(
+            relationship[
+                "client_user_id"
+            ]
+        )
+
+        self.therapist_user_id = str(
+            relationship[
+                "therapist_user_id"
+            ]
+        )
+
+    # =================================================================
+    # CREATE
+    # =================================================================
+
+    def create(self):
+        """
+        Create the conversation.
+
+        Returns the created conversation ID.
+        """
+
+        if self.conversation_id:
+            raise ValueError(
+                "Conversation already exists."
+            )
+
+        if not self.relationship_id:
+            raise ValueError(
+                "relationship_id is required."
+            )
+
+        query = """
         INSERT INTO conversations (
-            conversation_id,
-            user_id,
+            relationship_id,
             topic,
+            status,
             started_at
         )
+
         VALUES (
             %s,
             %s,
-            %s,
-            %s
+            'active',
+            NOW()
         )
-        RETURNING conversation_id;
+
+        RETURNING
+            conversation_id,
+            relationship_id,
+            topic,
+            status,
+            started_at,
+            ended_at,
+            metadata,
+            created_at,
+            updated_at,
+            deleted_at;
         """
 
-        return execute_read_write(
-            self._parameterize(
-                query,
-                (
-                    self.session_id,
-                    self.user_id,
-                    self.topic,
-                    self.started_at,
-                ),
-            )
+        result = execute_read_write(
+            query,
+            (
+                self.relationship_id,
+                self.topic,
+            ),
         )
+
+        if not result:
+            raise RuntimeError(
+                "Failed to create conversation."
+            )
+
+        conversation = result[0]
+
+        self.conversation_id = str(
+            conversation[
+                "conversation_id"
+            ]
+        )
+
+        self.relationship_id = str(
+            conversation[
+                "relationship_id"
+            ]
+        )
+
+        self.status = conversation[
+            "status"
+        ]
+
+        self.started_at = conversation[
+            "started_at"
+        ]
+
+        self.ended_at = conversation[
+            "ended_at"
+        ]
+
+        self._next_sequence_number = 1
+
+        return self.conversation_id
+
+    # =================================================================
+    # MESSAGE CREATION
+    # =================================================================
 
     def add_message(
         self,
-        role: str,
+        sender_user_id: str,
+        sender_type: str,
         content: str,
+        occurred_at=None,
+        metadata: dict[str, Any] | None = None,
     ):
         """
-        Store a message in the current conversation.
+        Add a client or therapist message.
+
+        Sender identity is validated against the relationship.
+
+        SAHA cannot be inserted as a sender.
         """
 
-        if role not in {
-            "user",
-            "assistant",
-            "system",
-        }:
+        if not self.conversation_id:
             raise ValueError(
-                "role must be 'user', 'assistant', or 'system'."
+                "Conversation has not been created."
             )
+
+        sender_user_id = str(
+            sender_user_id
+        ).strip()
+
+        if not sender_user_id:
+            raise ValueError(
+                "sender_user_id cannot be empty."
+            )
+
+        sender_type = str(
+            sender_type
+        ).strip().lower()
+
+        if sender_type not in VALID_SENDER_TYPES:
+            raise ValueError(
+                "sender_type must be 'client' "
+                "or 'therapist'."
+            )
+
+        content = str(
+            content
+        ).strip()
 
         if not content:
             raise ValueError(
                 "Message content cannot be empty."
             )
 
-        self.sequence_number += 1
+        # -------------------------------------------------------------
+        # Conversation status
+        # -------------------------------------------------------------
 
-        occurred_at = datetime.now(
-            timezone.utc
-        ).isoformat()
+        if self.status == "ended":
+            raise ValueError(
+                "Cannot add a message to an ended conversation."
+            )
+
+        if self.status == "paused":
+            raise ValueError(
+                "Cannot add a message to a paused conversation."
+            )
+
+        # -------------------------------------------------------------
+        # Validate sender against relationship
+        # -------------------------------------------------------------
+
+        if sender_type == "client":
+
+            if sender_user_id != self.client_user_id:
+                raise ValueError(
+                    "Sender does not match the client "
+                    "associated with this conversation."
+                )
+
+        elif sender_type == "therapist":
+
+            if sender_user_id != self.therapist_user_id:
+                raise ValueError(
+                    "Sender does not match the therapist "
+                    "associated with this conversation."
+                )
+
+        # -------------------------------------------------------------
+        # Metadata
+        # -------------------------------------------------------------
+
+        if metadata is None:
+            metadata = {}
+
+        if not isinstance(
+            metadata,
+            dict,
+        ):
+            raise ValueError(
+                "metadata must be an object."
+            )
+
+        # -------------------------------------------------------------
+        # Sequence number
+        # -------------------------------------------------------------
+
+        sequence_number = (
+            self._next_sequence_number
+        )
+
+        # -------------------------------------------------------------
+        # Insert message
+        # -------------------------------------------------------------
 
         query = """
         INSERT INTO conversation_messages (
-            message_id,
             conversation_id,
-            user_id,
-            role,
+            sender_user_id,
+            sender_type,
             content,
             sequence_number,
-            occurred_at
+            occurred_at,
+            metadata
         )
+
         VALUES (
             %s,
             %s,
             %s,
             %s,
             %s,
-            %s,
+            COALESCE(%s, NOW()),
             %s
         )
-        RETURNING message_id;
-        """
 
-        return execute_read_write(
-            self._parameterize(
-                query,
-                (
-                    str(uuid.uuid4()),
-                    self.session_id,
-                    self.user_id,
-                    role,
-                    content,
-                    self.sequence_number,
-                    occurred_at,
-                ),
-            )
-        )
-
-    def add_user_message(self, content: str):
-        return self.add_message(
-            "user",
-            content,
-        )
-
-    def add_assistant_message(self, content: str):
-        return self.add_message(
-            "assistant",
-            content,
-        )
-
-    def get_history(self):
-        """
-        Retrieve all messages belonging to this conversation.
-        """
-
-        query = """
-        SELECT
+        RETURNING
             message_id,
             conversation_id,
-            user_id,
-            role,
+            sender_user_id,
+            sender_type,
             content,
             sequence_number,
             occurred_at,
             created_at,
-            metadata
-        FROM conversation_messages
-        WHERE conversation_id = %s
-        ORDER BY sequence_number;
+            edited_at,
+            deleted_at,
+            metadata;
         """
 
-        return execute_read_only(
-            self._parameterize(
-                query,
-                (self.session_id,),
-            )
+        import psycopg2.extras
+
+        result = execute_read_write(
+            query,
+            (
+                self.conversation_id,
+                sender_user_id,
+                sender_type,
+                content,
+                sequence_number,
+                occurred_at,
+                psycopg2.extras.Json(
+                    metadata
+                ),
+            ),
         )
 
-    def end(self):
+        if not result:
+            raise RuntimeError(
+                "Failed to create conversation message."
+            )
+
+        message = result[0]
+
+        # -------------------------------------------------------------
+        # Advance local sequence state
+        # -------------------------------------------------------------
+
+        self._next_sequence_number = (
+            sequence_number + 1
+        )
+
+        # -------------------------------------------------------------
+        # Touch conversation
+        # -------------------------------------------------------------
+
+        self._touch_conversation()
+
+        return self._normalize_message(
+            message
+        )
+
+    # =================================================================
+    # MESSAGE CONVENIENCE METHODS
+    # =================================================================
+
+    def add_client_message(
+        self,
+        content: str,
+        occurred_at=None,
+        metadata: dict[str, Any] | None = None,
+    ):
         """
-        Mark the current conversation as completed.
+        Add a message from the client.
         """
 
-        ended_at = datetime.now(
-            timezone.utc
-        ).isoformat()
+        if not self.client_user_id:
+            raise ValueError(
+                "Client user is not available."
+            )
+
+        return self.add_message(
+            sender_user_id=self.client_user_id,
+            sender_type="client",
+            content=content,
+            occurred_at=occurred_at,
+            metadata=metadata,
+        )
+
+    def add_therapist_message(
+        self,
+        content: str,
+        occurred_at=None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        """
+        Add a message from the therapist.
+        """
+
+        if not self.therapist_user_id:
+            raise ValueError(
+                "Therapist user is not available."
+            )
+
+        return self.add_message(
+            sender_user_id=self.therapist_user_id,
+            sender_type="therapist",
+            content=content,
+            occurred_at=occurred_at,
+            metadata=metadata,
+        )
+
+    # =================================================================
+    # HISTORY
+    # =================================================================
+
+    def get_history(
+        self,
+        limit: int | None = None,
+        include_deleted: bool = False,
+    ):
+        """
+        Retrieve chronological conversation history.
+        """
+
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
+            )
+
+        if limit is not None:
+
+            if not isinstance(
+                limit,
+                int,
+            ):
+                raise ValueError(
+                    "limit must be an integer."
+                )
+
+            if limit < 1:
+                raise ValueError(
+                    "limit must be greater than zero."
+                )
+
+        deleted_condition = (
+            ""
+            if include_deleted
+            else "AND deleted_at IS NULL"
+        )
+
+        limit_clause = (
+            "LIMIT %s"
+            if limit is not None
+            else ""
+        )
+
+        parameters: list[Any] = [
+            self.conversation_id
+        ]
+
+        if limit is not None:
+            parameters.append(limit)
+
+        query = f"""
+        SELECT
+            message_id,
+            conversation_id,
+            sender_user_id,
+            sender_type,
+            content,
+            sequence_number,
+            occurred_at,
+            created_at,
+            edited_at,
+            deleted_at,
+            metadata
+
+        FROM conversation_messages
+
+        WHERE
+            conversation_id = %s
+            {deleted_condition}
+
+        ORDER BY
+            sequence_number ASC
+
+        {limit_clause};
+        """
+
+        result = execute_read_only(
+            query,
+            tuple(parameters),
+        )
+
+        return [
+            self._normalize_message(
+                message
+            )
+            for message in result
+        ]
+
+    def get_client_messages(
+        self,
+        limit: int | None = None,
+        include_deleted: bool = False,
+    ):
+        """
+        Retrieve client messages.
+        """
+
+        return self._get_messages_by_sender(
+            sender_type="client",
+            limit=limit,
+            include_deleted=include_deleted,
+        )
+
+    def get_therapist_messages(
+        self,
+        limit: int | None = None,
+        include_deleted: bool = False,
+    ):
+        """
+        Retrieve therapist messages.
+        """
+
+        return self._get_messages_by_sender(
+            sender_type="therapist",
+            limit=limit,
+            include_deleted=include_deleted,
+        )
+
+    def _get_messages_by_sender(
+        self,
+        sender_type: str,
+        limit: int | None = None,
+        include_deleted: bool = False,
+    ):
+        """
+        Internal sender-specific message retrieval.
+        """
+
+        if sender_type not in VALID_SENDER_TYPES:
+            raise ValueError(
+                "Invalid sender type."
+            )
+
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
+            )
+
+        if limit is not None:
+
+            if not isinstance(
+                limit,
+                int,
+            ):
+                raise ValueError(
+                    "limit must be an integer."
+                )
+
+            if limit < 1:
+                raise ValueError(
+                    "limit must be greater than zero."
+                )
+
+        deleted_condition = (
+            ""
+            if include_deleted
+            else "AND deleted_at IS NULL"
+        )
+
+        limit_clause = (
+            "LIMIT %s"
+            if limit is not None
+            else ""
+        )
+
+        parameters: list[Any] = [
+            self.conversation_id,
+            sender_type,
+        ]
+
+        if limit is not None:
+            parameters.append(limit)
+
+        query = f"""
+        SELECT
+            message_id,
+            conversation_id,
+            sender_user_id,
+            sender_type,
+            content,
+            sequence_number,
+            occurred_at,
+            created_at,
+            edited_at,
+            deleted_at,
+            metadata
+
+        FROM conversation_messages
+
+        WHERE
+            conversation_id = %s
+            AND sender_type = %s
+            {deleted_condition}
+
+        ORDER BY
+            sequence_number ASC
+
+        {limit_clause};
+        """
+
+        result = execute_read_only(
+            query,
+            tuple(parameters),
+        )
+
+        return [
+            self._normalize_message(
+                message
+            )
+            for message in result
+        ]
+
+    # =================================================================
+    # SINGLE MESSAGE
+    # =================================================================
+
+    def get_message(
+        self,
+        message_id: str,
+        include_deleted: bool = False,
+    ):
+        """
+        Retrieve one message.
+        """
+
+        message = get_message(
+            message_id,
+            include_deleted=include_deleted,
+        )
+
+        if message is None:
+            return None
+
+        # -------------------------------------------------------------
+        # Ensure message belongs to this conversation
+        # -------------------------------------------------------------
+
+        if (
+            self.conversation_id
+            and message["conversation_id"]
+            != self.conversation_id
+        ):
+            raise ValueError(
+                "Message does not belong to this conversation."
+            )
+
+        return self._normalize_message(
+            message
+        )
+
+    # =================================================================
+    # EDIT MESSAGE
+    # =================================================================
+
+    def edit_message(
+        self,
+        message_id: str,
+        content: str,
+    ):
+        """
+        Edit one message belonging to this conversation.
+        """
+
+        message = self.get_message(
+            message_id
+        )
+
+        if message is None:
+            raise ValueError(
+                "Message not found."
+            )
+
+        updated = self._edit_message_direct(
+            message_id,
+            content,
+        )
+
+        if not updated:
+            raise ValueError(
+                "Message could not be edited."
+            )
+
+        return self._normalize_message(
+            updated[0]
+        )
+
+    def _edit_message_direct(
+        self,
+        message_id: str,
+        content: str,
+    ):
+        """
+        Internal edit operation.
+
+        Kept here rather than importing a second abstraction so
+        conversation ownership can be validated before mutation.
+        """
+
+        content = str(
+            content
+        ).strip()
+
+        if not content:
+            raise ValueError(
+                "Message content cannot be empty."
+            )
 
         query = """
-        UPDATE conversations
+        UPDATE conversation_messages
+
         SET
-            ended_at = %s,
-            updated_at = %s
-        WHERE conversation_id = %s;
+            content = %s,
+            edited_at = NOW()
+
+        WHERE
+            message_id = %s
+            AND conversation_id = %s
+            AND deleted_at IS NULL
+
+        RETURNING
+            message_id,
+            conversation_id,
+            sender_user_id,
+            sender_type,
+            content,
+            sequence_number,
+            occurred_at,
+            created_at,
+            edited_at,
+            deleted_at,
+            metadata;
         """
 
         return execute_read_write(
-            self._parameterize(
-                query,
-                (
-                    ended_at,
-                    ended_at,
-                    self.session_id,
-                ),
-            )
+            query,
+            (
+                content,
+                message_id,
+                self.conversation_id,
+            ),
         )
 
-    def get_session_info(self):
-        return {
-            "conversation_id": self.session_id,
-            "user_id": self.user_id,
-            "topic": self.topic,
-        }
+    # =================================================================
+    # DELETE MESSAGE
+    # =================================================================
 
-    @staticmethod
-    def _parameterize(
-        query: str,
-        parameters: tuple,
+    def delete_message(
+        self,
+        message_id: str,
     ):
         """
-        Convert parameters into SQL-safe literals.
+        Soft-delete one message belonging to this conversation.
         """
 
-        for parameter in parameters:
-
-            if parameter is None:
-                value = "NULL"
-
-            elif isinstance(parameter, str):
-                value = "'{}'".format(
-                    parameter.replace("'", "''")
-                )
-
-            else:
-                value = str(parameter)
-
-            query = query.replace(
-                "%s",
-                value,
-                1,
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
             )
 
-        return query
+        message = get_message(
+            message_id
+        )
+
+        if message is None:
+            raise ValueError(
+                "Message not found."
+            )
+
+        if (
+            message["conversation_id"]
+            != self.conversation_id
+        ):
+            raise ValueError(
+                "Message does not belong to this conversation."
+            )
+
+        query = """
+        UPDATE conversation_messages
+
+        SET
+            deleted_at = NOW()
+
+        WHERE
+            message_id = %s
+            AND conversation_id = %s
+            AND deleted_at IS NULL
+
+        RETURNING
+            message_id,
+            conversation_id,
+            sender_user_id,
+            sender_type,
+            content,
+            sequence_number,
+            occurred_at,
+            created_at,
+            edited_at,
+            deleted_at,
+            metadata;
+        """
+
+        result = execute_read_write(
+            query,
+            (
+                message_id,
+                self.conversation_id,
+            ),
+        )
+
+        if not result:
+            raise ValueError(
+                "Message could not be deleted."
+            )
+
+        return self._normalize_message(
+            result[0]
+        )
+
+    # =================================================================
+    # TOPIC
+    # =================================================================
+
+    def update_topic(
+        self,
+        topic: str | None,
+    ):
+        """
+        Update conversation topic.
+        """
+
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
+            )
+
+        result = update_conversation(
+            self.conversation_id,
+            topic=topic,
+        )
+
+        if not result:
+            raise ValueError(
+                "Conversation not found."
+            )
+
+        conversation = result[0]
+
+        self.topic = conversation[
+            "topic"
+        ]
+
+        self.status = conversation[
+            "status"
+        ]
+
+        return conversation
+
+    # =================================================================
+    # STATUS
+    # =================================================================
+
+    def update_status(
+        self,
+        status: str,
+    ):
+        """
+        Change conversation status.
+        """
+
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
+            )
+
+        status = str(
+            status
+        ).strip().lower()
+
+        if status not in VALID_CONVERSATION_STATUSES:
+            raise ValueError(
+                "Invalid conversation status."
+            )
+
+        if (
+            self.status == "ended"
+            and status != "ended"
+        ):
+            raise ValueError(
+                "An ended conversation cannot be reopened."
+            )
+
+        result = update_conversation(
+            self.conversation_id,
+            status=status,
+        )
+
+        if not result:
+            raise ValueError(
+                "Conversation not found."
+            )
+
+        conversation = result[0]
+
+        self.status = conversation[
+            "status"
+        ]
+
+        self.ended_at = conversation[
+            "ended_at"
+        ]
+
+        return conversation
+
+    # =================================================================
+    # PAUSE
+    # =================================================================
+
+    def pause(self):
+        """
+        Pause the conversation.
+        """
+
+        if self.status == "ended":
+            raise ValueError(
+                "Ended conversation cannot be paused."
+            )
+
+        return self.update_status(
+            "paused"
+        )
+
+    # =================================================================
+    # RESUME
+    # =================================================================
+
+    def resume(self):
+        """
+        Resume a paused conversation.
+        """
+
+        if self.status == "ended":
+            raise ValueError(
+                "Ended conversation cannot be resumed."
+            )
+
+        return self.update_status(
+            "active"
+        )
+
+    # =================================================================
+    # END
+    # =================================================================
+
+    def end(self):
+        """
+        End the conversation.
+
+        Ending is terminal.
+        """
+
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
+            )
+
+        if self.status == "ended":
+
+            return {
+                "conversation_id":
+                    self.conversation_id,
+                "status": "ended",
+                "already_ended": True,
+            }
+
+        result = update_conversation(
+            self.conversation_id,
+            status="ended",
+        )
+
+        if not result:
+            raise ValueError(
+                "Conversation not found."
+            )
+
+        conversation = result[0]
+
+        self.status = "ended"
+
+        self.ended_at = conversation[
+            "ended_at"
+        ]
+
+        return conversation
+
+    # =================================================================
+    # DELETE
+    # =================================================================
+
+    def delete(self):
+        """
+        Soft-delete the conversation.
+        """
+
+        if not self.conversation_id:
+            raise ValueError(
+                "Conversation has not been created."
+            )
+
+        result = delete_conversation(
+            self.conversation_id
+        )
+
+        if not result:
+            raise ValueError(
+                "Conversation not found."
+            )
+
+        return result[0]
+
+    # =================================================================
+    # SESSION INFO
+    # =================================================================
+
+    def get_session_info(self):
+        """
+        Return the current conversation context.
+        """
+
+        return {
+            "conversation_id":
+                self.conversation_id,
+
+            "relationship_id":
+                self.relationship_id,
+
+            "client_user_id":
+                self.client_user_id,
+
+            "therapist_user_id":
+                self.therapist_user_id,
+
+            "topic":
+                self.topic,
+
+            "status":
+                self.status,
+
+            "started_at":
+                self.started_at,
+
+            "ended_at":
+                self.ended_at,
+        }
+
+    # =================================================================
+    # CONVERSATION TOUCH
+    # =================================================================
+
+    def _touch_conversation(self):
+        """
+        Update conversation.updated_at after message activity.
+
+        This is intentionally internal.
+        """
+
+        if not self.conversation_id:
+            return
+
+        query = """
+        UPDATE conversations
+
+        SET
+            updated_at = NOW()
+
+        WHERE
+            conversation_id = %s
+            AND deleted_at IS NULL;
+        """
+
+        execute_read_write(
+            query,
+            (
+                self.conversation_id,
+            ),
+        )
+
+    # =================================================================
+    # NORMALIZATION
+    # =================================================================
+
+    @staticmethod
+    def _normalize_message(
+        message: dict[str, Any],
+    ):
+        """
+        Normalize UUID fields returned by PostgreSQL.
+        """
+
+        message = dict(
+            message
+        )
+
+        for field in (
+            "message_id",
+            "conversation_id",
+            "sender_user_id",
+        ):
+
+            if message.get(field) is not None:
+
+                message[field] = str(
+                    message[field]
+                )
+
+        return message

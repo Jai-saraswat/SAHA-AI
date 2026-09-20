@@ -1,54 +1,51 @@
 """
-SAHA - Database Initialization
+SAHA - Database Schema Initialization
 
-Creates the SAHA PostgreSQL database if it does not already exist,
-then initializes it using Database/schema.sql.
+schema.sql is the single source of truth.
 
-If the database already exists, its details are displayed and the
-script exits without modifying the existing database.
+Behavior:
 
-Configuration is loaded from Database/.env.
+- If the database does not exist:
+    Create it and apply schema.sql.
+
+- If the database exists:
+    Compare its schema with schema.sql.
+
+    If identical:
+        Leave the database untouched.
+
+    If different:
+        Clear existing data and rebuild the schema from schema.sql.
 """
 
 from pathlib import Path
 import os
+import re
+import subprocess
 import sys
+import uuid
 
 import psycopg2
 from psycopg2 import sql
 from dotenv import load_dotenv
 
 
-def find_project_root() -> Path:
-    """
-    Locate the SAHA project root.
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-    Expected structure:
-
-    SAHA-AI/
-    └── Database/
-        ├── .env
-        ├── schema.sql
-        └── Scripts/
-            └── start_schema.py
-    """
-    return Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENV_FILE = PROJECT_ROOT / "Database" / ".env"
+SCHEMA_FILE = PROJECT_ROOT / "Database" / "schema.sql"
 
 
-def load_configuration(project_root: Path) -> None:
-    """Load PostgreSQL configuration from Database/.env."""
-    env_file = project_root / "Database" / ".env"
-
-    if not env_file.exists():
+def load_configuration():
+    if not ENV_FILE.exists():
         raise FileNotFoundError(
-            f"Environment file not found: {env_file}"
+            f"Environment file not found: {ENV_FILE}"
         )
 
-    load_dotenv(env_file)
-
-
-def get_configuration() -> dict:
-    """Read and validate PostgreSQL configuration."""
+    load_dotenv(ENV_FILE)
 
     configuration = {
         "host": os.getenv("POSTGRES_HOST", "localhost"),
@@ -58,11 +55,7 @@ def get_configuration() -> dict:
         "password": os.getenv("POSTGRES_PASSWORD"),
     }
 
-    required = (
-        "database",
-        "user",
-        "password",
-    )
+    required = ("database", "user", "password")
 
     missing = [
         key
@@ -72,7 +65,7 @@ def get_configuration() -> dict:
 
     if missing:
         raise RuntimeError(
-            "Missing required PostgreSQL configuration: "
+            "Missing PostgreSQL configuration: "
             + ", ".join(
                 f"POSTGRES_{key.upper()}"
                 for key in missing
@@ -82,208 +75,432 @@ def get_configuration() -> dict:
     return configuration
 
 
-def connect_to_server(configuration: dict):
-    """
-    Connect to the PostgreSQL server through the default
-    'postgres' maintenance database.
-    """
+# ---------------------------------------------------------------------
+# PostgreSQL connections
+# ---------------------------------------------------------------------
+
+def connect(database, configuration):
     return psycopg2.connect(
         host=configuration["host"],
         port=configuration["port"],
-        dbname="postgres",
+        dbname=database,
         user=configuration["user"],
         password=configuration["password"],
     )
 
 
-def get_database_details(connection, database_name: str):
-    """Return details for an existing PostgreSQL database."""
+def database_exists(configuration):
+    connection = connect("postgres", configuration)
 
-    query = """
-        SELECT
-            datname,
-            pg_get_userbyid(datdba) AS owner,
-            pg_encoding_to_char(encoding) AS encoding,
-            datcollate,
-            datctype,
-            pg_size_pretty(pg_database_size(datname)) AS size,
-            spcname AS tablespace
-        FROM pg_database
-        JOIN pg_tablespace
-            ON pg_database.dattablespace = pg_tablespace.oid
-        WHERE datname = %s;
-    """
-
-    with connection.cursor() as cursor:
-        cursor.execute(query, (database_name,))
-        return cursor.fetchone()
-
-
-def create_database(connection, database_name: str) -> None:
-    """
-    Create a PostgreSQL database.
-
-    CREATE DATABASE cannot run inside a transaction, so autocommit
-    is enabled for this operation.
-    """
-
-    connection.autocommit = True
-
-    with connection.cursor() as cursor:
-        cursor.execute(
-            sql.SQL("CREATE DATABASE {}").format(
-                sql.Identifier(database_name)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_database
+                    WHERE datname = %s
+                );
+                """,
+                (configuration["database"],),
             )
+
+            return cursor.fetchone()[0]
+
+    finally:
+        connection.close()
+
+
+def create_database(configuration, database_name):
+    connection = connect("postgres", configuration)
+
+    try:
+        connection.autocommit = True
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE DATABASE {}").format(
+                    sql.Identifier(database_name)
+                )
+            )
+
+    finally:
+        connection.close()
+
+
+def drop_database(configuration, database_name):
+    connection = connect("postgres", configuration)
+
+    try:
+        connection.autocommit = True
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                    sql.Identifier(database_name)
+                )
+            )
+
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------------
+# Schema application
+# ---------------------------------------------------------------------
+
+def apply_schema(database, configuration):
+    if not SCHEMA_FILE.exists():
+        raise FileNotFoundError(
+            f"Schema file not found: {SCHEMA_FILE}"
         )
 
-
-def initialize_schema(configuration: dict, schema_file: Path) -> None:
-    """Execute schema.sql against the newly created database."""
-
-    schema_sql = schema_file.read_text(encoding="utf-8")
+    schema_sql = SCHEMA_FILE.read_text(
+        encoding="utf-8"
+    )
 
     if not schema_sql.strip():
         raise RuntimeError(
-            f"Schema file is empty: {schema_file}"
+            f"Schema file is empty: {SCHEMA_FILE}"
         )
 
-    connection = None
+    connection = connect(database, configuration)
 
     try:
-        connection = psycopg2.connect(
-            host=configuration["host"],
-            port=configuration["port"],
-            dbname=configuration["database"],
-            user=configuration["user"],
-            password=configuration["password"],
-        )
+        with connection.cursor() as cursor:
+            cursor.execute(schema_sql)
 
-        with connection:
-            with connection.cursor() as cursor:
-                cursor.execute(schema_sql)
+        connection.commit()
 
-        print("Schema initialized successfully.")
+    except Exception:
+        connection.rollback()
+        raise
 
     finally:
-        if connection is not None:
-            connection.close()
+        connection.close()
 
 
-def main() -> None:
-    project_root = find_project_root()
+# ---------------------------------------------------------------------
+# Schema dump
+# ---------------------------------------------------------------------
 
-    load_configuration(project_root)
+def find_docker():
+    """
+    Find Docker executable.
+    """
 
-    configuration = get_configuration()
+    candidates = [
+        "docker",
+        r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+    ]
 
-    database_name = configuration["database"]
+    for candidate in candidates:
+        try:
+            result = subprocess.run(
+                [candidate, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
 
-    schema_file = project_root / "Database" / "schema.sql"
+            if result.returncode == 0:
+                return candidate
 
-    if not schema_file.exists():
-        raise FileNotFoundError(
-            f"Schema file not found: {schema_file}"
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    raise RuntimeError(
+        "Docker executable could not be found."
+    )
+
+
+def dump_schema(database, configuration):
+    """
+    Dump the database schema using pg_dump from the
+    running PostgreSQL Docker container.
+    """
+
+    docker = find_docker()
+
+    command = [
+        docker,
+        "exec",
+        "saha-postgres",
+        "pg_dump",
+        "--schema-only",
+        "--no-owner",
+        "--no-privileges",
+        "-U",
+        configuration["user"],
+        "-d",
+        database,
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "pg_dump failed:\n"
+            + result.stderr
         )
 
-    connection = None
+    return normalize_schema_dump(result.stdout)
+
+
+def normalize_schema_dump(schema):
+    """
+    Remove pg_dump-generated information that should not affect
+    schema comparison.
+
+    The actual database objects remain part of the comparison.
+    """
+
+    lines = []
+
+    for line in schema.splitlines():
+
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        if stripped.startswith("--"):
+            continue
+
+        if stripped.startswith("SET "):
+            continue
+
+        if stripped.startswith("SELECT pg_catalog.set_config"):
+            continue
+
+        if stripped.startswith("CREATE SCHEMA"):
+            continue
+
+        if stripped.startswith("COMMENT ON SCHEMA"):
+            continue
+
+        lines.append(
+            re.sub(r"\s+", " ", stripped)
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------
+# Database reset
+# ---------------------------------------------------------------------
+
+def reset_database(configuration):
+    """
+    Remove all existing public database objects and rebuild
+    them from schema.sql.
+    """
+
+    database = configuration["database"]
+
+    connection = connect(database, configuration)
 
     try:
-        print(
-            f"Checking PostgreSQL database '{database_name}'..."
-        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DROP SCHEMA IF EXISTS public CASCADE;"
+            )
 
-        connection = connect_to_server(configuration)
+            cursor.execute(
+                "CREATE SCHEMA public;"
+            )
 
-        database_details = get_database_details(
-            connection,
-            database_name,
-        )
+        connection.commit()
 
-        # --------------------------------------------------------
-        # Database already exists
-        # --------------------------------------------------------
+    except Exception:
+        connection.rollback()
+        raise
 
-        if database_details:
-            (
-                name,
-                owner,
-                encoding,
-                collation,
-                ctype,
-                size,
-                tablespace,
-            ) = database_details
+    finally:
+        connection.close()
 
-            print("\nDatabase already exists.")
-            print("----------------------------------------")
-            print(f"Name       : {name}")
-            print(f"Owner      : {owner}")
-            print(f"Encoding   : {encoding}")
-            print(f"Collation  : {collation}")
-            print(f"CTYPE      : {ctype}")
-            print(f"Size       : {size}")
-            print(f"Tablespace : {tablespace}")
-            print("----------------------------------------")
-            print("No changes were made.")
+    apply_schema(
+        database,
+        configuration,
+    )
 
-            return
 
-        # --------------------------------------------------------
-        # Database does not exist
-        # --------------------------------------------------------
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 
-        print(
-            f"Database '{database_name}' does not exist."
-        )
+def main():
+
+    configuration = load_configuration()
+
+    database = configuration["database"]
+
+    print("=" * 60)
+    print("SAHA DATABASE SCHEMA CHECK")
+    print("=" * 60)
+
+    # -------------------------------------------------------------
+    # Database existence
+    # -------------------------------------------------------------
+
+    if not database_exists(configuration):
 
         print(
-            f"Creating database '{database_name}'..."
+            f"\nDatabase '{database}' does not exist."
+        )
+
+        print(
+            f"Creating database '{database}'..."
         )
 
         create_database(
-            connection,
-            database_name,
+            configuration,
+            database,
         )
 
-        print("Database created successfully.")
+        print("Database created.")
 
-    except psycopg2.Error as exc:
-        print(
-            f"\nPostgreSQL error: {exc}",
-            file=sys.stderr,
+        print("Applying schema.sql...")
+
+        apply_schema(
+            database,
+            configuration,
         )
-        sys.exit(1)
 
-    finally:
-        if connection is not None:
-            connection.close()
+        print("Schema applied successfully.")
+        print("\nDatabase is ready.")
 
-    # ------------------------------------------------------------
-    # Initialize newly created database
-    # ------------------------------------------------------------
+        return
+
+    print(
+        f"\nDatabase '{database}' already exists."
+    )
+
+    # -------------------------------------------------------------
+    # Create temporary database
+    # -------------------------------------------------------------
+
+    temporary_database = (
+        f"saha_schema_check_{uuid.uuid4().hex[:12]}"
+    )
+
+    print(
+        "\nCreating temporary database for schema comparison..."
+    )
+
+    create_database(
+        configuration,
+        temporary_database,
+    )
 
     try:
+
+        # ---------------------------------------------------------
+        # Apply schema.sql to temporary database
+        # ---------------------------------------------------------
+
         print(
-            f"Initializing schema from '{schema_file}'..."
+            "Applying schema.sql to temporary database..."
         )
 
-        initialize_schema(
+        apply_schema(
+            temporary_database,
             configuration,
-            schema_file,
+        )
+
+        # ---------------------------------------------------------
+        # Dump both schemas
+        # ---------------------------------------------------------
+
+        print(
+            "Comparing database schema with schema.sql..."
+        )
+
+        current_schema = dump_schema(
+            database,
+            configuration,
+        )
+
+        expected_schema = dump_schema(
+            temporary_database,
+            configuration,
+        )
+
+        # ---------------------------------------------------------
+        # Compare
+        # ---------------------------------------------------------
+
+        if current_schema == expected_schema:
+
+            print(
+                "\nSchema is already up to date."
+            )
+
+            print(
+                "No changes were made to the database."
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Schema changed
+        # ---------------------------------------------------------
+
+        print(
+            "\nSchema changes detected."
         )
 
         print(
-            f"\nSAHA database '{database_name}' "
-            "is ready."
+            "Resetting database schema..."
         )
 
-    except psycopg2.Error as exc:
+        reset_database(
+            configuration,
+        )
+
         print(
-            f"\nPostgreSQL error while initializing schema: {exc}",
-            file=sys.stderr,
+            "Updated schema applied successfully."
         )
-        sys.exit(1)
 
+    finally:
+
+        # ---------------------------------------------------------
+        # Remove temporary database
+        # ---------------------------------------------------------
+
+        print(
+            "\nRemoving temporary comparison database..."
+        )
+
+        drop_database(
+            configuration,
+            temporary_database,
+        )
+
+    print(
+        "\nSAHA database is ready."
+    )
+
+
+# ---------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+
+    try:
+        main()
+
+    except Exception as exc:
+
+        print(
+            f"\nERROR: {exc}",
+            file=sys.stderr,
+        )
+
+        sys.exit(1)
