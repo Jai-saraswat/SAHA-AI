@@ -1,0 +1,4 @@
+*.py linguist-detectable
+*.sql linguist-detectable
+*.yml linguist-detectable
+*.yaml linguist-detectable
